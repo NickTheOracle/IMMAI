@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-Immigration Information Chat (single-file, multilingual, with local LLM + KB fallback)
-
+Immigration Information Chat (single-file, multilingual, local LLM + KB fallback)
 Informational use only. Not legal advice. No attorney–client relationship.
+
 Run:
-  pip install streamlit reportlab transformers sentencepiece torch
-  streamlit run immigration_chat.py
+  pip install streamlit transformers sentencepiece torch
+  # Optional for PDF export:
+  pip install reportlab
+  streamlit run IMMAI.py
 """
 
 from __future__ import annotations
@@ -16,9 +18,17 @@ import urllib.parse
 from typing import List, Dict, Tuple
 
 import streamlit as st
-from reportlab.lib.pagesizes import letter
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
-from reportlab.lib.styles import getSampleStyleSheet
+
+# -------- OPTIONAL PDF DEPENDENCY (REPORTLAB) --------
+try:
+    from reportlab.lib.pagesizes import letter
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    REPORTLAB_OK = True
+except Exception:
+    REPORTLAB_OK = False
+
+# -------- LOCAL LLM (TRANSFORMERS) --------
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
 # ============================== UI STRINGS ==============================
@@ -232,7 +242,9 @@ def compose_answer(question: str, lang: str) -> str:
     return L[lang]["fallback"]
 
 # ============================== EXPORTS ==============================
-def pdf_from_transcript(messages: List[Tuple[str, str]], lang: str) -> bytes:
+def pdf_from_transcript(messages: List[Tuple[str, str]], lang: str) -> bytes | None:
+    if not REPORTLAB_OK:
+        return None
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=letter)
     styles = getSampleStyleSheet()
@@ -296,18 +308,24 @@ if submitted:
         st.session_state.messages.append((L[lang]["you_name"], q))
         answer = compose_answer(q, lang)
         st.session_state.messages.append((L[lang]["bot_name"], answer))
-    st.experimental_rerun()
+    # No experimental rerun here; Streamlit already reruns after form submit.
 
 c1, c2, c3, c4 = st.columns(4)
 if c1.button(L[lang]["clear"]):
     st.session_state.messages = []
-    st.experimental_rerun()
+    st.rerun()  # safe use only on destructive reset
 
 pdf_bytes = pdf_from_transcript(st.session_state.messages, lang)
-c2.download_button(L[lang]["download_pdf"], data=pdf_bytes, file_name="immigration_chat_transcript.pdf", mime="application/pdf")
+if pdf_bytes:
+    c2.download_button(L[lang]["download_pdf"], data=pdf_bytes,
+                       file_name="immigration_chat_transcript.pdf",
+                       mime="application/pdf")
+else:
+    c2.write("PDF export unavailable")
 
 txt_blob = txt_from_transcript(st.session_state.messages, lang)
-c3.download_button(L[lang]["download_txt"], data=txt_blob.encode("utf-8"), file_name="immigration_chat_transcript.txt", mime="text/plain")
+c3.download_button(L[lang]["download_txt"], data=txt_blob.encode("utf-8"),
+                   file_name="immigration_chat_transcript.txt", mime="text/plain")
 
 subject = urllib.parse.quote(L[lang]["mailto_subject"])
 body = urllib.parse.quote(txt_blob[:1800])
