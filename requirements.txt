@@ -1,0 +1,5 @@
+streamlit>=1.31
+reportlab>=3.6
+transformers>=4.40
+sentencepiece>=0.1.99
+torch>=2.2 ; platform_system != "Darwin"  # optional if you kept the LLM
