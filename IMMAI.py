@@ -1,32 +1,27 @@
 #!/usr/bin/env python3
 """
-IMMigration RAG Chat — single-file Streamlit app
+Immigration Research Chat — single-file Streamlit app (RAG, cites .gov)
 
-Purpose
-- Answer immigration questions with short, high-level summaries grounded ONLY in primary, reputable sources.
-- Automatically searches trusted domains (USCIS, State/NVC, EOIR/DOJ, DHS/CBP/ICE, Federal Register, Congress).
-- Extracts pages, ranks relevant passages, composes an answer, and shows inline citations [1], [2], … with links.
-- Not legal advice. No attorney–client relationship.
+- Searches only trusted government domains.
+- Extracts pages, ranks relevant passages, composes a grounded answer, shows citations.
+- Informational only. Not legal advice. No attorney–client relationship.
 
-Run
-  python -m pip install --upgrade pip
-  pip install streamlit duckduckgo-search trafilatura sentence-transformers transformers torch
-  # Optional (PDF export of the chat):
+Run:
+  pip install --upgrade pip
+  pip install streamlit duckduckgo-search trafilatura sentence-transformers transformers torch numpy
+  # Optional PDF export:
   pip install reportlab
   streamlit run imm_rag_chat.py
 """
 
 from __future__ import annotations
-import os
-import re
 import io
-import math
-import time
+import re
 import html
 import textwrap
 import urllib.parse
-from typing import List, Dict, Tuple, Optional
 from dataclasses import dataclass
+from typing import List, Dict, Tuple, Optional
 
 import streamlit as st
 
@@ -39,11 +34,9 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# Search and Retrieval
+# Search / scrape / vector / generate
 from duckduckgo_search import DDGS
 import trafilatura
-
-# Embeddings + Generator
 from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 import torch
@@ -53,16 +46,16 @@ import numpy as np
 
 TRUSTED_DOMAINS = [
     "uscis.gov",
-    "travel.state.gov",      # NVC/consular
-    "justice.gov",           # EOIR (immigration courts)
+    "travel.state.gov",
+    "justice.gov",
     "dhs.gov",
     "cbp.gov",
     "ice.gov",
-    "congress.gov",          # statute text
-    "federalregister.gov",   # rules
-    "govinfo.gov",           # CFR/FR archive
-    "whitehouse.gov",        # proclamations (stable enough for history)
-    "usa.gov",               # general
+    "congress.gov",
+    "federalregister.gov",
+    "govinfo.gov",
+    "whitehouse.gov",
+    "usa.gov",
 ]
 
 MAX_RESULTS_PER_DOMAIN = 3
@@ -70,52 +63,38 @@ GLOBAL_RESULT_CAP = 12
 FETCH_TIMEOUT = 20
 CHUNK_CHARS = 1200
 TOP_CHUNKS = 5
-GEN_MAX_NEW_TOKENS = 350
+GEN_MAX_NEW_TOKENS = 320
 
 DISCLAIMER = (
     "**Disclaimer:** Informational only. Not legal advice. No attorney–client relationship. "
     "Citations are to government sources. Laws and policy change."
 )
-
-REFUSAL = (
-    "Requests to lie, use false documents, evade the law, or commit fraud are refused."
+REFUSAL = "Requests to lie, use false documents, evade the law, or commit fraud are refused."
+INSTRUCTIONS_PROMPT = (
+    "You are an immigration information assistant. Answer ONLY using the provided sources. "
+    "Be concise, neutral, and high-level. Do not invent facts, fees, timelines, or tactics. "
+    "Flag uncertainty explicitly. End with a one-sentence caveat that this is general information, not legal advice."
 )
-
-INSTRUCTIONS_PROMPT = """You are an immigration information assistant.
-Answer ONLY using the provided sources. Quote or paraphrase minimally and concisely.
-Do not invent facts. Do not give fees, wait times, or step-by-step legal tactics.
-Flag uncertainty explicitly. End with a one-sentence caveat that this is general information, not legal advice.
-Write in clear plain English."""
-
 SYSTEM_SUFFIX = " This summary is not legal advice."
 
-# --------------------------- Small helpers ---------------------------
+# --------------------------- Helpers ---------------------------
 
 def norm_space(s: str) -> str:
-    return re.sub(r"\s+", " ", s).strip()
+    return re.sub(r"\s+", " ", (s or "")).strip()
 
 def is_trusted(url: str) -> bool:
     try:
-        host = urllib.parse.urlsplit(url).netloc.lower()
-        # strip subdomains and port
-        host = host.split(":")[0]
+        host = urllib.parse.urlsplit(url).netloc.lower().split(":")[0]
     except Exception:
         return False
     return any(host.endswith(dom) for dom in TRUSTED_DOMAINS)
 
 def safe_title(url: str) -> str:
-    # Derive a short label if no title available
     try:
-        host = urllib.parse.urlsplit(url).netloc
-        path = urllib.parse.urlsplit(url).path or "/"
-        return f"{host}{path}"
+        parts = urllib.parse.urlsplit(url)
+        return f"{parts.netloc}{parts.path or '/'}"
     except Exception:
         return url
-
-def batched(iterable, n):
-    it = list(iterable)
-    for i in range(0, len(it), n):
-        yield it[i:i+n]
 
 # --------------------------- Retrieval ---------------------------
 
@@ -147,28 +126,27 @@ EMBED = load_embedder()
 TOK, LLM = load_llm()
 
 def ddg_trusted_search(query: str) -> List[Hit]:
-    # Prefer trusted domains via site: filters; fall back to post-filter
     hits: List[Hit] = []
     q = norm_space(query)
-    # Issue multiple queries, one per domain, to steer DDG
-    with DDGS() as ddgs:
-        for dom in TRUSTED_DOMAINS:
-            q_dom = f"site:{dom} {q}"
-            for r in ddgs.text(q_dom, max_results=MAX_RESULTS_PER_DOMAIN, region="us-en", safesearch="moderate"):
-                url = r.get("href") or r.get("url") or ""
-                title = r.get("title") or ""
-                body = r.get("body") or ""
-                if not url:
-                    continue
-                if not is_trusted(url):
-                    continue
-                hits.append(Hit(url=url, title=title, snippet=body))
+    try:
+        with DDGS() as ddgs:
+            for dom in TRUSTED_DOMAINS:
+                q_dom = f"site:{dom} {q}"
+                for r in ddgs.text(q_dom, max_results=MAX_RESULTS_PER_DOMAIN, region="us-en", safesearch="moderate"):
+                    url = r.get("href") or r.get("url") or ""
+                    title = r.get("title") or ""
+                    body = r.get("body") or ""
+                    if not url or not is_trusted(url):
+                        continue
+                    hits.append(Hit(url=url, title=title, snippet=body))
+                    if len(hits) >= GLOBAL_RESULT_CAP:
+                        break
                 if len(hits) >= GLOBAL_RESULT_CAP:
                     break
-            if len(hits) >= GLOBAL_RESULT_CAP:
-                break
+    except Exception:
+        pass
     # Deduplicate by URL
-    seen, uniq = set(), []
+    uniq, seen = [], set()
     for h in hits:
         if h.url in seen:
             continue
@@ -176,8 +154,8 @@ def ddg_trusted_search(query: str) -> List[Hit]:
         uniq.append(h)
     return uniq
 
-def fetch_and_chunk(url: str, title_fallback: str) -> List[Tuple[str, str]]:
-    html_doc = None
+def fetch_and_chunk(url: str, title_fallback: str) -> List[Tuple[str, str, str]]:
+    """Return list of (url, title, chunk_text)."""
     try:
         html_doc = trafilatura.fetch_url(url, timeout=FETCH_TIMEOUT)
     except Exception:
@@ -194,43 +172,45 @@ def fetch_and_chunk(url: str, title_fallback: str) -> List[Tuple[str, str]]:
     if not text:
         return []
 
-    # naive title parse; trafilatura sometimes returns title in metadata, but we keep fallback
     title = title_fallback or safe_title(url)
-
-    # Chunk by characters to keep ordering
-    chunks = []
+    chunks: List[Tuple[str, str, str]] = []
     for i in range(0, len(text), CHUNK_CHARS):
-        seg = text[i:i+CHUNK_CHARS]
-        if len(seg) < 240 and i > 0:
+        seg = text[i:i + CHUNK_CHARS]
+        if i > 0 and len(seg) < 240:
             break
-        chunks.append((title, seg))
-    return [(url, title, c) for _, c in [(title, seg) for seg in [ch[1] for ch in [(title, seg) for seg in [t for _, t in chunks]]]]]
+        chunks.append((url, title, seg))
+    return chunks
 
 def embed(texts: List[str]) -> np.ndarray:
-    # Returns (n, d) array
-    vecs = EMBED.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
-    return vecs
+    return EMBED.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
 
 def rank_chunks(question: str, docs: List[Tuple[str, str, str]]) -> List[DocChunk]:
     if not docs:
         return []
     qv = embed([question])[0]
-    texts = [d[2] for d in docs]
-    tv = embed(texts)
-    sims = (tv @ qv)  # cosine due to normalized vectors
-    scored = []
+    tv = embed([d[2] for d in docs])
+    sims = (tv @ qv)  # cosine similarity due to normalization
+    scored: List[DocChunk] = []
     for (url, title, chunk), s in zip(docs, sims):
         scored.append(DocChunk(url=url, title=title or safe_title(url), text=chunk, score=float(s)))
     scored.sort(key=lambda x: x.score, reverse=True)
     return scored
 
-def make_prompt(question: str, top_chunks: List[DocChunk], numbered_sources: Dict[str, int]) -> str:
-    lines = [INSTRUCTIONS_PROMPT, ""]
-    lines.append("SOURCES:")
-    for i, ch in enumerate(top_chunks, 1):
-        idx = numbered_sources[ch.url]
+def format_citations(urls: List[str]) -> Dict[str, int]:
+    mapping: Dict[str, int] = {}
+    idx = 1
+    for u in urls:
+        if u not in mapping:
+            mapping[u] = idx
+            idx += 1
+    return mapping
+
+def make_prompt(question: str, top_chunks: List[DocChunk], numbered: Dict[str, int]) -> str:
+    lines = [INSTRUCTIONS_PROMPT, "", "SOURCES:"]
+    for ch in top_chunks:
+        i = numbered[ch.url]
         snippet = textwrap.shorten(ch.text, width=800, placeholder=" …")
-        lines.append(f"[{idx}] {ch.title} :: {ch.url}")
+        lines.append(f"[{i}] {ch.title} :: {ch.url}")
         lines.append(f"Excerpt: {snippet}")
         lines.append("")
     lines.append("QUESTION:")
@@ -242,76 +222,59 @@ def make_prompt(question: str, top_chunks: List[DocChunk], numbered_sources: Dic
 def generate_answer(prompt: str) -> str:
     inputs = TOK(prompt, return_tensors="pt", truncation=True, max_length=1024)
     with torch.no_grad():
-        out = LLM.generate(
-            **inputs,
-            max_new_tokens=GEN_MAX_NEW_TOKENS,
-            temperature=0.2,
-            do_sample=False,
-        )
+        out = LLM.generate(**inputs, max_new_tokens=GEN_MAX_NEW_TOKENS, temperature=0.2, do_sample=False)
     return TOK.decode(out[0], skip_special_tokens=True).strip()
 
-def format_citations(urls: List[str]) -> Dict[str, int]:
-    # Map unique URL -> citation index
-    mapping: Dict[str, int] = {}
-    i = 1
-    for u in urls:
-        if u not in mapping:
-            mapping[u] = i
-            i += 1
-    return mapping
+def extractive_fallback(chunks: List[DocChunk]) -> str:
+    """If LLM fails, return concise extractive bullets from top chunks."""
+    bullets: List[str] = []
+    for ch in chunks[:3]:
+        # first 2 sentences
+        sents = re.split(r"(?<=[\.\?\!])\s+", ch.text)
+        pick = " ".join(sents[:2])
+        bullets.append(textwrap.shorten(pick, width=300, placeholder=" …"))
+    if not bullets:
+        return "No qualifying primary sources parsed."
+    return " • " + "\n • ".join(bullets)
 
 def build_research_answer(question: str) -> Tuple[str, List[Tuple[int, str, str]]]:
-    # Search
     hits = ddg_trusted_search(question)
     if not hits:
-        return ("No qualifying primary sources found on trusted domains. Rephrase and focus the question.", [])
+        return ("No qualifying primary sources found on trusted domains.", [])
 
-    # Fetch + chunk
     docs: List[Tuple[str, str, str]] = []
     for h in hits:
-        chs = fetch_and_chunk(h.url, h.title or safe_title(h.url))
-        # Use first few chunks per doc to reduce noise
-        docs.extend(chs[:3])
+        docs.extend(fetch_and_chunk(h.url, h.title or safe_title(h.url))[:3])
 
     if not docs:
-        return ("Sources were found but could not be parsed. Try a more specific question.", [])
+        return ("Sources were found but could not be parsed.", [])
 
-    # Rank
-    ranked = rank_chunks(question, docs)
-    top = ranked[:TOP_CHUNKS]
+    ranked = rank_chunks(question, docs)[:TOP_CHUNKS]
+    numbered = format_citations([c.url for c in ranked])
+    prompt = make_prompt(question, ranked, numbered)
 
-    # Number sources by URL
-    numbered = format_citations([c.url for c in top])
+    try:
+        raw = generate_answer(prompt) or ""
+    except Exception:
+        raw = ""
 
-    # Compose prompt
-    prompt = make_prompt(question, top, numbered)
+    if raw:
+        answer = norm_space(raw) + SYSTEM_SUFFIX
+    else:
+        answer = extractive_fallback(ranked) + SYSTEM_SUFFIX
 
-    # Generate
-    raw = generate_answer(prompt)
-    if not raw:
-        return ("Unable to compose a grounded summary from the retrieved sources.", [])
-
-    # Append hard disclaimer
-    answer = norm_space(raw) + SYSTEM_SUFFIX
-
-    # Build citation table [(index, title, url)]
-    citations = []
-    # Keep order by index
+    citations: List[Tuple[int, str, str]] = []
     for url, idx in sorted(numbered.items(), key=lambda kv: kv[1]):
-        # find a title from our ranked list
-        title = next((c.title for c in top if c.url == url), None) or safe_title(url)
+        title = next((c.title for c in ranked if c.url == url), None) or safe_title(url)
         citations.append((idx, title, url))
-
-    return (answer, citations)
+    return answer, citations
 
 # --------------------------- UI ---------------------------
 
 st.set_page_config(page_title="Immigration Research Chat", layout="centered")
 
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # list[(role, text)]
-if "last_answer" not in st.session_state:
-    st.session_state.last_answer = ""
+    st.session_state.messages = []      # list[(role, text)]
 if "last_citations" not in st.session_state:
     st.session_state.last_citations = []
 
@@ -320,11 +283,7 @@ st.markdown(DISCLAIMER)
 st.markdown(REFUSAL)
 st.markdown("---")
 
-# Chat history
-for role, text in st.session_state.messages:
-    st.markdown(f"**{role}:** {text}")
-
-# Input
+# INPUT FIRST so submission updates state BEFORE rendering history
 with st.form("ask", clear_on_submit=True):
     q = st.text_area("Ask about immigration (general topics, forms, concepts).", height=120)
     submitted = st.form_submit_button("Send")
@@ -334,15 +293,24 @@ if submitted:
     if not user_q:
         st.session_state.messages.append(("System", "Enter a question."))
     else:
+        # Append user msg + assistant placeholder, then overwrite in-place after research
         st.session_state.messages.append(("You", user_q))
-        with st.spinner("Researching trusted sources…"):
-            ans, cites = build_research_answer(user_q)
-        st.session_state.last_answer = ans
-        st.session_state.last_citations = cites
-        st.session_state.messages.append(("Assistant", ans))
+        st.session_state.messages.append(("Assistant", "Researching trusted sources…"))
+        placeholder_index = len(st.session_state.messages) - 1
 
-# Latest answer (with citations list)
-if st.session_state.last_answer:
+        with st.spinner("Searching government sources…"):
+            ans, cites = build_research_answer(user_q)
+
+        # In-place update for immediate chat refresh
+        st.session_state.messages[placeholder_index] = ("Assistant", ans)
+        st.session_state.last_citations = cites
+
+# RENDER HISTORY AFTER submission handling so new Q/A appears immediately
+for i, (role, text) in enumerate(st.session_state.messages):
+    st.markdown(f"**{role}:** {text}", unsafe_allow_html=False)
+
+# Latest citations section
+if st.session_state.last_citations:
     st.markdown("**Sources**")
     for idx, title, url in st.session_state.last_citations:
         st.markdown(f"[{idx}] [{html.escape(title)}]({url})")
@@ -352,7 +320,6 @@ st.markdown("---")
 # Export
 col1, col2, col3 = st.columns(3)
 
-# TXT export
 def transcript_txt() -> str:
     lines = ["Immigration Research Chat", "", DISCLAIMER, REFUSAL, ""]
     for role, text in st.session_state.messages:
@@ -371,7 +338,6 @@ col1.download_button(
     mime="text/plain",
 )
 
-# PDF export (optional)
 def transcript_pdf() -> Optional[bytes]:
     if not REPORTLAB_OK:
         return None
@@ -411,6 +377,5 @@ else:
 # Clear
 if col3.button("Clear chat"):
     st.session_state.messages = []
-    st.session_state.last_answer = ""
     st.session_state.last_citations = []
     st.rerun()
