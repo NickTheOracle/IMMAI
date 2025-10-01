@@ -1,25 +1,36 @@
 #!/usr/bin/env python3
 """
-Immigration Information Chat (single-file, multilingual, local LLM + KB fallback)
-Informational use only. Not legal advice. No attorney–client relationship.
+IMMigration RAG Chat — single-file Streamlit app
 
-Run:
-  pip install streamlit transformers sentencepiece torch
-  # Optional for PDF export:
+Purpose
+- Answer immigration questions with short, high-level summaries grounded ONLY in primary, reputable sources.
+- Automatically searches trusted domains (USCIS, State/NVC, EOIR/DOJ, DHS/CBP/ICE, Federal Register, Congress).
+- Extracts pages, ranks relevant passages, composes an answer, and shows inline citations [1], [2], … with links.
+- Not legal advice. No attorney–client relationship.
+
+Run
+  python -m pip install --upgrade pip
+  pip install streamlit duckduckgo-search trafilatura sentence-transformers transformers torch
+  # Optional (PDF export of the chat):
   pip install reportlab
-  streamlit run IMMAI.py
+  streamlit run imm_rag_chat.py
 """
 
 from __future__ import annotations
-import io
+import os
 import re
-import unicodedata
+import io
+import math
+import time
+import html
+import textwrap
 import urllib.parse
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional
+from dataclasses import dataclass
 
 import streamlit as st
 
-# -------- OPTIONAL PDF DEPENDENCY (REPORTLAB) --------
+# Optional PDF dependency
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
@@ -28,308 +39,378 @@ try:
 except Exception:
     REPORTLAB_OK = False
 
-# -------- LOCAL LLM (TRANSFORMERS) --------
+# Search and Retrieval
+from duckduckgo_search import DDGS
+import trafilatura
+
+# Embeddings + Generator
+from sentence_transformers import SentenceTransformer
 from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+import torch
+import numpy as np
 
-# ============================== UI STRINGS ==============================
-L: Dict[str, Dict[str, str]] = {
-    "en": {
-        "app_title": "Immigration Information Chat",
-        "disclaimer": "**Disclaimer:** Informational only. Not legal advice. No attorney–client relationship.",
-        "input_label": "Type your question",
-        "send": "Send",
-        "clear": "Clear chat",
-        "download_pdf": "Download transcript (PDF)",
-        "download_txt": "Download transcript (TXT)",
-        "mailto_btn": "Open email to send transcript",
-        "lang_picker": "Choose language / Elija idioma / Escolha idioma",
-        "system_name": "System",
-        "you_name": "You",
-        "bot_name": "Assistant",
-        "fallback": "I provide general information only. Review official USCIS/NVC instructions and consider consulting an accredited representative.",
-        "refusal": "I will not assist with lying, false documents, evasion, or fraud. Use official USCIS resources and qualified help.",
-        "bad_request": "Enter a question.",
-        "footer_note": "Stable references only. No fees, timelines, or evolving policy.",
-        "mailto_subject": "Immigration Q&A Transcript",
-        "mailto_hint": "If your email client truncates long messages, copy and paste the transcript."
-    },
-    "es": {
-        "app_title": "Chat de Información Migratoria",
-        "disclaimer": "**Aviso:** Solo informativo. No es asesoría legal. No crea relación abogado–cliente.",
-        "input_label": "Escriba su pregunta",
-        "send": "Enviar",
-        "clear": "Borrar chat",
-        "download_pdf": "Descargar transcripción (PDF)",
-        "download_txt": "Descargar transcripción (TXT)",
-        "mailto_btn": "Abrir correo para enviar transcripción",
-        "lang_picker": "Elija idioma / Choose language / Escolha idioma",
-        "system_name": "Sistema",
-        "you_name": "Usted",
-        "bot_name": "Asistente",
-        "fallback": "Brindo información general. Revise las instrucciones oficiales de USCIS/NVC y considere consultar un representante acreditado.",
-        "refusal": "No ayudaré con mentir, documentos falsos, evasión o fraude. Use recursos oficiales de USCIS y ayuda calificada.",
-        "bad_request": "Escriba una pregunta.",
-        "footer_note": "Solo referencias estables. Sin tarifas, tiempos ni políticas cambiantes.",
-        "mailto_subject": "Transcripción de Preguntas Migratorias",
-        "mailto_hint": "Si su correo recorta mensajes largos, copie y pegue la transcripción."
-    },
-    "pt": {
-        "app_title": "Chat de Informações de Imigração",
-        "disclaimer": "**Aviso:** Somente informativo. Não é aconselhamento jurídico. Não cria relação advogado–cliente.",
-        "input_label": "Digite sua pergunta",
-        "send": "Enviar",
-        "clear": "Limpar conversa",
-        "download_pdf": "Baixar transcrição (PDF)",
-        "download_txt": "Baixar transcrição (TXT)",
-        "mailto_btn": "Abrir e-mail para enviar transcrição",
-        "lang_picker": "Escolha idioma / Choose language / Elija idioma",
-        "system_name": "Sistema",
-        "you_name": "Você",
-        "bot_name": "Assistente",
-        "fallback": "Forneço informações gerais. Revise as instruções oficiais do USCIS/NVC e considere consultar um representante credenciado.",
-        "refusal": "Não ajudarei com mentiras, documentos falsos, evasão ou fraude. Use recursos oficiais do USCIS e ajuda qualificada.",
-        "bad_request": "Digite uma pergunta.",
-        "footer_note": "Apenas referências estáveis. Sem taxas, prazos ou políticas em mudança.",
-        "mailto_subject": "Transcrição de Perguntas de Imigração",
-        "mailto_hint": "Se o e-mail encurtar mensagens longas, copie e cole a transcrição."
-    },
-}
+# --------------------------- Config ---------------------------
 
-# ============================== KNOWLEDGE BASE ==============================
-KB: List[Dict] = [
-    {
-        "tags": ["i-130", "spouse", "marriage", "petitioner", "relative", "family petition", "petición familiar", "petição familiar"],
-        "en": "Form I-130 establishes a qualifying family relationship. Approval alone does not grant status. Next steps are Adjustment of Status (inside, if eligible) or Consular Processing (abroad).",
-        "es": "El Formulario I-130 establece una relación familiar calificada. La aprobación por sí sola no otorga estatus. Los siguientes pasos son Ajuste de Estatus (dentro, si elegible) o Proceso Consular (en el exterior).",
-        "pt": "O Formulário I-130 comprova vínculo familiar qualificado. A aprovação não concede status por si só. Os próximos passos são Ajuste de Status (dentro, se elegível) ou Processamento Consular (no exterior).",
-    },
-    {
-        "tags": ["i-485", "adjustment of status", "aos", "ajuste", "ajuste de estatus"],
-        "en": "Adjustment of Status (I-485) is for eligible applicants in the U.S., often requiring a lawful entry. Inadmissibility can require waivers.",
-        "es": "El Ajuste de Estatus (I-485) es para solicitantes elegibles dentro de EE. UU., a menudo requiriendo una entrada lícita. La inadmisibilidad puede requerir exenciones.",
-        "pt": "O Ajuste de Status (I-485) é para elegíveis nos EUA, geralmente exigindo entrada lícita. A inadmissibilidade pode exigir perdões.",
-    },
-    {
-        "tags": ["consular processing", "nvc", "ds-260", "consulado", "processo consular"],
-        "en": "Consular Processing uses NVC, fees, civil documents, and DS-260, then an interview. Unlawful presence or prior orders can require waivers.",
-        "es": "El Proceso Consular usa NVC, tarifas, documentos civiles y DS-260, luego una entrevista. La presencia ilegal u órdenes previas pueden requerir exenciones.",
-        "pt": "O Processamento Consular usa NVC, taxas, documentos civis e DS-260, seguido de entrevista. Presença ilegal ou ordens prévias podem exigir perdões.",
-    },
-    {
-        "tags": ["i-601a", "provisional waiver", "provisional", "601a"],
-        "en": "I-601A provisional waiver is generally for applicants inside the U.S. with a qualifying USC/LPR spouse or parent. Not filed abroad.",
-        "es": "La exención provisional I-601A es generalmente para solicitantes dentro de EE. UU. con cónyuge o padre/madre ciudadano o LPR calificador. No se presenta en el exterior.",
-        "pt": "O perdão provisório I-601A é geralmente para requerentes nos EUA com cônjuge ou pai/mãe cidadão/LPR qualificado. Não é apresentado no exterior.",
-    },
-    {
-        "tags": ["i-601", "waiver", "extreme hardship", "exención", "perdão"],
-        "en": "I-601 can waive certain inadmissibility (including unlawful presence) by showing extreme hardship to a qualifying USC/LPR spouse or parent, usually at the consular stage.",
-        "es": "El I-601 puede eximir ciertas causales de inadmisibilidad (incluida la presencia ilegal) demostrando dificultad extrema a cónyuge o padre/madre ciudadano/LPR calificador, usualmente en etapa consular.",
-        "pt": "O I-601 pode dispensar certas inadmissibilidades (inclusive presença ilegal) mostrando dificuldade extrema a cônjuge ou pai/mãe cidadão/LPR qualificado, geralmente na fase consular.",
-    },
-    {
-        "tags": ["i-212", "permission to reapply", "removal", "deportation", "reingreso ilegal", "reentrada ilegal"],
-        "en": "I-212 requests permission to reapply for admission after removal or certain orders. It may be required in addition to other waivers.",
-        "es": "El I-212 solicita permiso para volver a pedir admisión tras una remoción u órdenes. Puede requerirse además de otras exenciones.",
-        "pt": "O I-212 solicita permissão para voltar a requerer admissão após remoção ou certas ordens. Pode ser necessário além de outros perdões.",
-    },
-    {
-        "tags": ["212(a)(9)(c)", "permanent bar", "illegal reentry", "barra permanente"],
-        "en": "INA 212(a)(9)(C) can trigger a permanent bar for illegal reentry after removal or after >1 year of unlawful presence. Options can be limited; long-term strategies may apply.",
-        "es": "INA 212(a)(9)(C) puede generar barra permanente por reingreso ilegal tras remoción o tras >1 año de presencia ilegal. Las opciones pueden ser limitadas; pueden aplicar estrategias a largo plazo.",
-        "pt": "INA 212(a)(9)(C) pode gerar barreira permanente por reentrada ilegal após remoção ou após >1 ano de presença ilegal. As opções podem ser limitadas; estratégias de longo prazo podem se aplicar.",
-    },
-    {
-        "tags": ["n-600", "citizenship", "derivation", "derivación", "derivação", "320", "§320"],
-        "en": "N-600 documents citizenship acquired or derived; for INA §320 derivation: LPR child, under 18, residing in the U.S., in the legal and physical custody of the citizen parent.",
-        "es": "El N-600 documenta ciudadanía adquirida o derivada; para derivación INA §320: menor LPR, menor de 18, residente en EE. UU., bajo custodia legal y física del padre/madre ciudadano.",
-        "pt": "O N-600 documenta cidadania adquirida ou derivada; para derivação INA §320: menor LPR, menor de 18, residente nos EUA, sob custódia legal e física do pai/mãe cidadão.",
-    },
-    {
-        "tags": ["crba", "consular report of birth abroad", "passport at post", "ciudadanía al nacer"],
-        "en": "CRBA can document citizenship at birth abroad when transmission requirements are met. Often paired with first U.S. passport at post.",
-        "es": "El CRBA puede documentar ciudadanía al nacer fuera de EE. UU. cuando se cumplen los requisitos de transmisión. A menudo con el primer pasaporte en el consulado.",
-        "pt": "O CRBA pode documentar cidadania ao nascer no exterior quando os requisitos de transmissão são atendidos. Geralmente com o primeiro passaporte no consulado.",
-    },
-    {
-        "tags": ["parole", "inspection", "lawful entry", "entrada lícita", "paroled", "inspected"],
-        "en": "Many AOS paths rely on a lawful entry (inspection or parole). Manner of last entry affects eligibility.",
-        "es": "Muchas vías de AOS dependen de una entrada lícita (inspección o parole). La forma de la última entrada afecta la elegibilidad.",
-        "pt": "Muitas vias de AOS dependem de entrada lícita (inspeção ou parole). A forma da última entrada afeta a elegibilidade.",
-    },
-    {
-        "tags": ["ead", "i-765", "work authorization", "autorización de empleo", "autorização de trabalho"],
-        "en": "Work authorization (I-765) may be available when a principal application is pending and the category permits it. Eligibility depends on the underlying basis.",
-        "es": "La autorización de empleo (I-765) puede estar disponible cuando una solicitud principal está pendiente y la categoría lo permite. La elegibilidad depende de la base subyacente.",
-        "pt": "A autorização de trabalho (I-765) pode estar disponível quando um pedido principal está pendente e a categoria permite. A elegibilidade depende da base subjacente.",
-    },
+TRUSTED_DOMAINS = [
+    "uscis.gov",
+    "travel.state.gov",      # NVC/consular
+    "justice.gov",           # EOIR (immigration courts)
+    "dhs.gov",
+    "cbp.gov",
+    "ice.gov",
+    "congress.gov",          # statute text
+    "federalregister.gov",   # rules
+    "govinfo.gov",           # CFR/FR archive
+    "whitehouse.gov",        # proclamations (stable enough for history)
+    "usa.gov",               # general
 ]
 
-# ============================== LLM LOAD (CACHED) ==============================
+MAX_RESULTS_PER_DOMAIN = 3
+GLOBAL_RESULT_CAP = 12
+FETCH_TIMEOUT = 20
+CHUNK_CHARS = 1200
+TOP_CHUNKS = 5
+GEN_MAX_NEW_TOKENS = 350
+
+DISCLAIMER = (
+    "**Disclaimer:** Informational only. Not legal advice. No attorney–client relationship. "
+    "Citations are to government sources. Laws and policy change."
+)
+
+REFUSAL = (
+    "Requests to lie, use false documents, evade the law, or commit fraud are refused."
+)
+
+INSTRUCTIONS_PROMPT = """You are an immigration information assistant.
+Answer ONLY using the provided sources. Quote or paraphrase minimally and concisely.
+Do not invent facts. Do not give fees, wait times, or step-by-step legal tactics.
+Flag uncertainty explicitly. End with a one-sentence caveat that this is general information, not legal advice.
+Write in clear plain English."""
+
+SYSTEM_SUFFIX = " This summary is not legal advice."
+
+# --------------------------- Small helpers ---------------------------
+
+def norm_space(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+def is_trusted(url: str) -> bool:
+    try:
+        host = urllib.parse.urlsplit(url).netloc.lower()
+        # strip subdomains and port
+        host = host.split(":")[0]
+    except Exception:
+        return False
+    return any(host.endswith(dom) for dom in TRUSTED_DOMAINS)
+
+def safe_title(url: str) -> str:
+    # Derive a short label if no title available
+    try:
+        host = urllib.parse.urlsplit(url).netloc
+        path = urllib.parse.urlsplit(url).path or "/"
+        return f"{host}{path}"
+    except Exception:
+        return url
+
+def batched(iterable, n):
+    it = list(iterable)
+    for i in range(0, len(it), n):
+        yield it[i:i+n]
+
+# --------------------------- Retrieval ---------------------------
+
+@dataclass
+class Hit:
+    url: str
+    title: str
+    snippet: str
+
+@dataclass
+class DocChunk:
+    url: str
+    title: str
+    text: str
+    score: float
+
+@st.cache_resource(show_spinner=False)
+def load_embedder() -> SentenceTransformer:
+    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
 @st.cache_resource(show_spinner=False)
 def load_llm():
-    name = "google/flan-t5-base"
+    name = "google/flan-t5-base"  # small, CPU-friendly
     tok = AutoTokenizer.from_pretrained(name)
     model = AutoModelForSeq2SeqLM.from_pretrained(name)
     return tok, model
 
+EMBED = load_embedder()
 TOK, LLM = load_llm()
 
-# ============================== GUARDRAILS ==============================
-PROHIBITED_PATTERNS = [
-    r"\b(lie|forg(e|ing)|fake|counterfeit|cheat|bypass|evade|bribe|falsif(y|icar|icar)|fraud)\b",
-    r"how to.*(misrepresent|hide.*arrest|hide.*marriage|work illegally|overstay)",
-]
+def ddg_trusted_search(query: str) -> List[Hit]:
+    # Prefer trusted domains via site: filters; fall back to post-filter
+    hits: List[Hit] = []
+    q = norm_space(query)
+    # Issue multiple queries, one per domain, to steer DDG
+    with DDGS() as ddgs:
+        for dom in TRUSTED_DOMAINS:
+            q_dom = f"site:{dom} {q}"
+            for r in ddgs.text(q_dom, max_results=MAX_RESULTS_PER_DOMAIN, region="us-en", safesearch="moderate"):
+                url = r.get("href") or r.get("url") or ""
+                title = r.get("title") or ""
+                body = r.get("body") or ""
+                if not url:
+                    continue
+                if not is_trusted(url):
+                    continue
+                hits.append(Hit(url=url, title=title, snippet=body))
+                if len(hits) >= GLOBAL_RESULT_CAP:
+                    break
+            if len(hits) >= GLOBAL_RESULT_CAP:
+                break
+    # Deduplicate by URL
+    seen, uniq = set(), []
+    for h in hits:
+        if h.url in seen:
+            continue
+        seen.add(h.url)
+        uniq.append(h)
+    return uniq
 
-def normalize(text: str) -> str:
-    t = text.lower()
-    t = "".join(c for c in unicodedata.normalize("NFKD", t) if not unicodedata.combining(c))
-    t = re.sub(r"\s+", " ", t).strip()
-    return t
-
-def detect_lang(s: str) -> str:
-    s2 = f" {normalize(s)} "
-    es_hits = sum(w in s2 for w in [" el ", " la ", " de ", " que ", " usted ", " gracias ", " dónde ", " estoy ", " hijo ", " cónyuge "])
-    pt_hits = sum(w in s2 for w in [" de ", " que ", " você ", " voce ", " obrigado ", " onde ", " filho ", " cônjuge ", " conjuge "])
-    if es_hits > pt_hits and es_hits >= 2:
-        return "es"
-    if pt_hits > es_hits and pt_hits >= 2:
-        return "pt"
-    return "en"
-
-def blocked_request(q: str) -> bool:
-    qn = normalize(q)
-    return any(re.search(pat, qn) for pat in PROHIBITED_PATTERNS)
-
-def search_kb(question: str, lang: str, k: int = 3) -> List[str]:
-    qn = normalize(question)
-    scored: List[Tuple[int, Dict]] = []
-    for entry in KB:
-        score = sum(tag in qn for tag in entry["tags"])
-        if score:
-            scored.append((score, entry))
-    scored.sort(key=lambda t: t[0], reverse=True)
-    return [entry[lang] for _, entry in scored[:k]]
-
-def generate_llm_answer(question: str, lang: str) -> str:
-    sys_instr = {
-        "en": ("You are an immigration information assistant. Provide high-level, non-legal, general guidance only. "
-               "No fees, timelines, or evolving policy. Refuse fraud/illegality. Be concise."),
-        "es": ("Eres un asistente de información migratoria. Proporciona orientación general y no legal. "
-               "Sin tarifas, tiempos ni políticas cambiantes. Rechaza fraude/ilegalidad. Sé conciso."),
-        "pt": ("Você é um assistente de informações de imigração. Forneça orientação geral e não jurídica. "
-               "Sem taxas, prazos ou políticas em mudança. Recuse fraude/ilegalidade. Seja conciso."),
-    }[lang]
-    prompt = f"{sys_instr}\n\nQuestion:\n{question}\n\nAnswer:"
-    inputs = TOK(prompt, return_tensors="pt", truncation=True, max_length=512)
-    out = LLM.generate(**inputs, max_new_tokens=220, temperature=0.2, do_sample=False)
-    return TOK.decode(out[0], skip_special_tokens=True).strip()
-
-def compose_answer(question: str, lang: str) -> str:
-    if not question or not question.strip():
-        return L[lang]["bad_request"]
-    if blocked_request(question):
-        return L[lang]["refusal"]
+def fetch_and_chunk(url: str, title_fallback: str) -> List[Tuple[str, str]]:
+    html_doc = None
     try:
-        ans = generate_llm_answer(question, lang)
-        if ans:
-            return f"{ans} {L[lang]['fallback']}"
+        html_doc = trafilatura.fetch_url(url, timeout=FETCH_TIMEOUT)
     except Exception:
-        pass
-    hits = search_kb(question, lang)
-    if hits:
-        return f"{' '.join(hits)} {L[lang]['fallback']}"
-    return L[lang]["fallback"]
+        html_doc = None
+    if not html_doc:
+        return []
+    try:
+        extracted = trafilatura.extract(html_doc, include_comments=False, include_tables=False)
+    except Exception:
+        extracted = None
+    if not extracted:
+        return []
+    text = norm_space(extracted)
+    if not text:
+        return []
 
-# ============================== EXPORTS ==============================
-def pdf_from_transcript(messages: List[Tuple[str, str]], lang: str) -> bytes | None:
-    if not REPORTLAB_OK:
-        return None
-    buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=letter)
-    styles = getSampleStyleSheet()
-    story: List = [
-        Paragraph(L[lang]["app_title"], styles["Title"]),
-        Spacer(1, 12),
-        Paragraph(L[lang]["disclaimer"], styles["Italic"]),
-        Spacer(1, 12),
-    ]
-    for role, text in messages:
-        story.append(Paragraph(f"{role}:", styles["Heading4"]))
-        story.append(Paragraph(text.replace("\n", "<br/>"), styles["Normal"]))
-        story.append(Spacer(1, 8))
-    story.append(Spacer(1, 12))
-    story.append(Paragraph(L[lang]["footer_note"], styles["Italic"]))
-    doc.build(story)
-    return buf.getvalue()
+    # naive title parse; trafilatura sometimes returns title in metadata, but we keep fallback
+    title = title_fallback or safe_title(url)
 
-def txt_from_transcript(messages: List[Tuple[str, str]], lang: str) -> str:
-    lines = [L[lang]["app_title"], "", L[lang]["disclaimer"], ""]
-    for role, text in messages:
-        lines.append(f"{role}: {text}")
-    lines += ["", L[lang]["footer_note"]]
+    # Chunk by characters to keep ordering
+    chunks = []
+    for i in range(0, len(text), CHUNK_CHARS):
+        seg = text[i:i+CHUNK_CHARS]
+        if len(seg) < 240 and i > 0:
+            break
+        chunks.append((title, seg))
+    return [(url, title, c) for _, c in [(title, seg) for seg in [ch[1] for ch in [(title, seg) for seg in [t for _, t in chunks]]]]]
+
+def embed(texts: List[str]) -> np.ndarray:
+    # Returns (n, d) array
+    vecs = EMBED.encode(texts, convert_to_numpy=True, normalize_embeddings=True)
+    return vecs
+
+def rank_chunks(question: str, docs: List[Tuple[str, str, str]]) -> List[DocChunk]:
+    if not docs:
+        return []
+    qv = embed([question])[0]
+    texts = [d[2] for d in docs]
+    tv = embed(texts)
+    sims = (tv @ qv)  # cosine due to normalized vectors
+    scored = []
+    for (url, title, chunk), s in zip(docs, sims):
+        scored.append(DocChunk(url=url, title=title or safe_title(url), text=chunk, score=float(s)))
+    scored.sort(key=lambda x: x.score, reverse=True)
+    return scored
+
+def make_prompt(question: str, top_chunks: List[DocChunk], numbered_sources: Dict[str, int]) -> str:
+    lines = [INSTRUCTIONS_PROMPT, ""]
+    lines.append("SOURCES:")
+    for i, ch in enumerate(top_chunks, 1):
+        idx = numbered_sources[ch.url]
+        snippet = textwrap.shorten(ch.text, width=800, placeholder=" …")
+        lines.append(f"[{idx}] {ch.title} :: {ch.url}")
+        lines.append(f"Excerpt: {snippet}")
+        lines.append("")
+    lines.append("QUESTION:")
+    lines.append(question)
+    lines.append("")
+    lines.append("ANSWER:")
     return "\n".join(lines)
 
-# ============================== APP ==============================
-st.set_page_config(page_title="Immigration Chat", layout="centered")
+def generate_answer(prompt: str) -> str:
+    inputs = TOK(prompt, return_tensors="pt", truncation=True, max_length=1024)
+    with torch.no_grad():
+        out = LLM.generate(
+            **inputs,
+            max_new_tokens=GEN_MAX_NEW_TOKENS,
+            temperature=0.2,
+            do_sample=False,
+        )
+    return TOK.decode(out[0], skip_special_tokens=True).strip()
 
-if "lang" not in st.session_state:
-    st.session_state.lang = "en"
+def format_citations(urls: List[str]) -> Dict[str, int]:
+    # Map unique URL -> citation index
+    mapping: Dict[str, int] = {}
+    i = 1
+    for u in urls:
+        if u not in mapping:
+            mapping[u] = i
+            i += 1
+    return mapping
+
+def build_research_answer(question: str) -> Tuple[str, List[Tuple[int, str, str]]]:
+    # Search
+    hits = ddg_trusted_search(question)
+    if not hits:
+        return ("No qualifying primary sources found on trusted domains. Rephrase and focus the question.", [])
+
+    # Fetch + chunk
+    docs: List[Tuple[str, str, str]] = []
+    for h in hits:
+        chs = fetch_and_chunk(h.url, h.title or safe_title(h.url))
+        # Use first few chunks per doc to reduce noise
+        docs.extend(chs[:3])
+
+    if not docs:
+        return ("Sources were found but could not be parsed. Try a more specific question.", [])
+
+    # Rank
+    ranked = rank_chunks(question, docs)
+    top = ranked[:TOP_CHUNKS]
+
+    # Number sources by URL
+    numbered = format_citations([c.url for c in top])
+
+    # Compose prompt
+    prompt = make_prompt(question, top, numbered)
+
+    # Generate
+    raw = generate_answer(prompt)
+    if not raw:
+        return ("Unable to compose a grounded summary from the retrieved sources.", [])
+
+    # Append hard disclaimer
+    answer = norm_space(raw) + SYSTEM_SUFFIX
+
+    # Build citation table [(index, title, url)]
+    citations = []
+    # Keep order by index
+    for url, idx in sorted(numbered.items(), key=lambda kv: kv[1]):
+        # find a title from our ranked list
+        title = next((c.title for c in top if c.url == url), None) or safe_title(url)
+        citations.append((idx, title, url))
+
+    return (answer, citations)
+
+# --------------------------- UI ---------------------------
+
+st.set_page_config(page_title="Immigration Research Chat", layout="centered")
+
 if "messages" not in st.session_state:
-    st.session_state.messages = []  # list of (role_display, text)
+    st.session_state.messages = []  # list[(role, text)]
+if "last_answer" not in st.session_state:
+    st.session_state.last_answer = ""
+if "last_citations" not in st.session_state:
+    st.session_state.last_citations = []
 
-lang_choice = st.selectbox(
-    L["en"]["lang_picker"],
-    ["English", "Español", "Português"],
-    index={"en": 0, "es": 1, "pt": 2}[st.session_state.lang],
-)
-st.session_state.lang = {"English": "en", "Español": "es", "Português": "pt"}[lang_choice]
-lang = st.session_state.lang
-
-st.title(L[lang]["app_title"])
-st.markdown(L[lang]["disclaimer"])
+st.title("Immigration Research Chat")
+st.markdown(DISCLAIMER)
+st.markdown(REFUSAL)
 st.markdown("---")
 
+# Chat history
 for role, text in st.session_state.messages:
     st.markdown(f"**{role}:** {text}")
 
-with st.form("chat_form", clear_on_submit=True):
-    q = st.text_area(L[lang]["input_label"], height=120, key="q_input")
-    submitted = st.form_submit_button(L[lang]["send"])
+# Input
+with st.form("ask", clear_on_submit=True):
+    q = st.text_area("Ask about immigration (general topics, forms, concepts).", height=120)
+    submitted = st.form_submit_button("Send")
 
 if submitted:
-    user_lang = detect_lang(q) if q.strip() else lang
-    if len(st.session_state.messages) == 0:
-        lang = user_lang
-        st.session_state.lang = user_lang
-    if not q.strip():
-        st.session_state.messages.append((L[lang]["system_name"], L[lang]["bad_request"]))
+    user_q = norm_space(q)
+    if not user_q:
+        st.session_state.messages.append(("System", "Enter a question."))
     else:
-        st.session_state.messages.append((L[lang]["you_name"], q))
-        answer = compose_answer(q, lang)
-        st.session_state.messages.append((L[lang]["bot_name"], answer))
-    # No experimental rerun here; Streamlit already reruns after form submit.
+        st.session_state.messages.append(("You", user_q))
+        with st.spinner("Researching trusted sources…"):
+            ans, cites = build_research_answer(user_q)
+        st.session_state.last_answer = ans
+        st.session_state.last_citations = cites
+        st.session_state.messages.append(("Assistant", ans))
 
-c1, c2, c3, c4 = st.columns(4)
-if c1.button(L[lang]["clear"]):
-    st.session_state.messages = []
-    st.rerun()  # safe use only on destructive reset
+# Latest answer (with citations list)
+if st.session_state.last_answer:
+    st.markdown("**Sources**")
+    for idx, title, url in st.session_state.last_citations:
+        st.markdown(f"[{idx}] [{html.escape(title)}]({url})")
 
-pdf_bytes = pdf_from_transcript(st.session_state.messages, lang)
+st.markdown("---")
+
+# Export
+col1, col2, col3 = st.columns(3)
+
+# TXT export
+def transcript_txt() -> str:
+    lines = ["Immigration Research Chat", "", DISCLAIMER, REFUSAL, ""]
+    for role, text in st.session_state.messages:
+        lines.append(f"{role}: {text}")
+    if st.session_state.last_citations:
+        lines += ["", "Sources:"]
+        for idx, title, url in st.session_state.last_citations:
+            lines.append(f"[{idx}] {title} — {url}")
+    return "\n".join(lines)
+
+txt_blob = transcript_txt()
+col1.download_button(
+    "Download transcript (TXT)",
+    data=txt_blob.encode("utf-8"),
+    file_name="immigration_chat_transcript.txt",
+    mime="text/plain",
+)
+
+# PDF export (optional)
+def transcript_pdf() -> Optional[bytes]:
+    if not REPORTLAB_OK:
+        return None
+    buf = io.BytesIO()
+    styles = getSampleStyleSheet()
+    story = [
+        Paragraph("Immigration Research Chat", styles["Title"]),
+        Spacer(1, 12),
+        Paragraph(DISCLAIMER, styles["Italic"]),
+        Paragraph(REFUSAL, styles["Italic"]),
+        Spacer(1, 12),
+    ]
+    for role, text in st.session_state.messages:
+        story.append(Paragraph(f"{role}:", styles["Heading4"]))
+        story.append(Paragraph(html.escape(text).replace("\n", "<br/>"), styles["Normal"]))
+        story.append(Spacer(1, 8))
+    if st.session_state.last_citations:
+        story.append(Spacer(1, 12))
+        story.append(Paragraph("Sources", styles["Heading3"]))
+        for idx, title, url in st.session_state.last_citations:
+            story.append(Paragraph(f"[{idx}] {html.escape(title)} — {html.escape(url)}", styles["Normal"]))
+    doc = SimpleDocTemplate(buf, pagesize=letter)
+    doc.build(story)
+    return buf.getvalue()
+
+pdf_bytes = transcript_pdf()
 if pdf_bytes:
-    c2.download_button(L[lang]["download_pdf"], data=pdf_bytes,
-                       file_name="immigration_chat_transcript.pdf",
-                       mime="application/pdf")
+    col2.download_button(
+        "Download transcript (PDF)",
+        data=pdf_bytes,
+        file_name="immigration_chat_transcript.pdf",
+        mime="application/pdf",
+    )
 else:
-    c2.write("PDF export unavailable")
+    col2.write("PDF export unavailable")
 
-txt_blob = txt_from_transcript(st.session_state.messages, lang)
-c3.download_button(L[lang]["download_txt"], data=txt_blob.encode("utf-8"),
-                   file_name="immigration_chat_transcript.txt", mime="text/plain")
-
-subject = urllib.parse.quote(L[lang]["mailto_subject"])
-body = urllib.parse.quote(txt_blob[:1800])
-mail_href = f"mailto:?subject={subject}&body={body}"
-c4.markdown(f"[{L[lang]['mailto_btn']}]({mail_href})")
-
-st.caption(L[lang]["footer_note"])
+# Clear
+if col3.button("Clear chat"):
+    st.session_state.messages = []
+    st.session_state.last_answer = ""
+    st.session_state.last_citations = []
+    st.rerun()
